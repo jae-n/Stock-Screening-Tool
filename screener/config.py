@@ -101,3 +101,4 @@ class Config(metaclass=SingletonMeta):
     def require_ntfy(self):
         if not self.ntfy_topic:
             raise RuntimeError("Set NTFY_TOPIC, e.g. export NTFY_TOPIC=some-long-random-string")
+        return self.ntfy_topic
