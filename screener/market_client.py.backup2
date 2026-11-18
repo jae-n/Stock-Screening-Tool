@@ -1,0 +1,177 @@
+"""MarketDataClient singleton: the only code that talks to Yahoo Finance (via yfinance)."""
+
+from screener.config import Config
+from screener.singleton import SingletonMeta
+
+
+class MarketDataClient(metaclass=SingletonMeta):
+    def __init__(self):
+        self._config = Config()
+        self._yf = None
+
+    @property
+    def yf(self):
+        """Lazy import so the rest of the package works without yfinance installed."""
+        if self._yf is None:
+            try:
+                import yfinance
+            except ImportError as exc:
+                raise RuntimeError("yfinance is required for --prices: pip install yfinance") from exc
+            self._yf = yfinance
+        return self._yf
+
+    def fetch(self, ticker):
+        """Return (snapshot dict, [(YYYY-MM, close)], [(YYYY-MM-DD, split_ratio)])."""
+        t = self.yf.Ticker(ticker)
+        info = t.info or {}
+
+        snapshot = {
+            "price": info.get("currentPrice") or info.get("regularMarketPrice"),
+            "market_cap": info.get("marketCap"),
+            "shares_outstanding": info.get("sharesOutstanding"),
+            "forward_eps": info.get("forwardEps"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+        }
+
+        # auto_adjust=False -> "Close" is split-adjusted but NOT dividend-adjusted,
+        # which is what valuation multiples need.
+        hist = t.history(period=f"{self._config.price_history_years}y",
+                         interval="1mo", auto_adjust=False)
+        closes = []
+        if hist is not None and not hist.empty:
+            closes = [(idx.strftime("%Y-%m"), float(c)) for idx, c in hist["Close"].dropna().items()]
+
+        raw_splits = t.splits
+        splits = []
+        if raw_splits is not None and len(raw_splits):
+            splits = [(idx.strftime("%Y-%m-%d"), float(r)) for idx, r in raw_splits.items()]
+
+        return snapshot, closes, splits
+
+    # ---- discovery & market overview ---------------------------------------
+    @staticmethod
+    def _symbols(result):
+        return [q["symbol"] for q in (result or {}).get("quotes", []) if q.get("symbol")]
+
+    def predefined(self, name, size):
+        """Symbols from one of Yahoo's ready-made screens (e.g. 'undervalued_large_caps')."""
+        return self._symbols(self.yf.screen(name, count=size))
+
+    def sweep(self, sector, size):
+        """Symbols from our own query for one sector: US-listed, sizeable, profitable at a sane
+        price, decent return on equity, modest debt. Largest first, so the list stays stable
+        from day to day. This is a loose pre-filter; the 10 gates make the real decision."""
+        cfg, EQ = self._config, self.yf.EquityQuery
+        query = EQ("and", [
+            EQ("eq", ["region", "us"]),
+            EQ("is-in", ["exchange", "NMS", "NYQ"]),
+            EQ("eq", ["sector", sector]),
+            EQ("gte", ["intradaymarketcap", cfg.discovery_min_cap]),
+            EQ("btwn", ["peratio.lasttwelvemonths", 0, cfg.discovery_max_pe]),
+            EQ("gte", ["returnonequity.lasttwelvemonths", cfg.discovery_min_roe]),
+            EQ("lte", ["totaldebtequity.lasttwelvemonths", cfg.discovery_max_de_pct]),
+        ])
+        return self._symbols(self.yf.screen(query, size=size, sortField="intradaymarketcap",
+                                            sortAsc=False))
+
+    def closes(self, symbol, period="1y"):
+        """[(YYYY-MM-DD, close)] daily closes, oldest first (works for indices like ^GSPC)."""
+        hist = self.yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=False)
+        if hist is None or hist.empty:
+            return []
+        return [(idx.strftime("%Y-%m-%d"), float(c)) for idx, c in hist["Close"].dropna().items()]
+
+    def long_history(self, symbol, years):
+        """[(YYYY-MM, close, adj_close)] monthly. `close` is split-adjusted only (for valuation);
+        `adj_close` also reinvests dividends (for total returns)."""
+        hist = self.yf.Ticker(symbol).history(period=f"{years}y", interval="1mo", auto_adjust=False)
+        if hist is None or hist.empty:
+            return []
+        out = []
+        for idx, row in hist.iterrows():
+            close = row.get("Close")
+            adj = row.get("Adj Close", close)
+            if close != close or adj != adj:                 # NaN
+                continue
+            out.append((idx.strftime("%Y-%m"), float(close), float(adj)))
+        return out
+        # ---- Official US stock listings ----------------------------------------
+    
+    def listed_symbols(self):
+        """Return filtered Nasdaq, NYSE, NYSE American, and S&P 500 symbols."""
+        import io
+        import re
+        import requests
+        import pandas as pd
+
+        symbols = set()
+
+        excluded_terms = re.compile(
+            r"\b(warrant|warrants|right|rights|unit|units|"
+            r"preferred|preference|depositary|depositary receipt|"
+            r"subscription receipt|when issued)\b",
+            re.IGNORECASE,
+        )
+
+        def add(symbol):
+            if not symbol:
+                return
+            symbol = str(symbol).strip().upper()
+            symbol = symbol.replace(".", "-").replace("/", "-")
+            if symbol and symbol.isascii():
+                symbols.add(symbol)
+
+        urls = [
+            ("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+             "nasdaq"),
+            ("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+             "other"),
+        ]
+
+        for url, kind in urls:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            lines = response.text.splitlines()
+
+            if not lines:
+                continue
+
+            header = lines[0].split("|")
+
+            for line in lines[1:]:
+                if not line or line.startswith("File Creation Time"):
+                    continue
+
+                row = dict(zip(header, line.split("|")))
+
+                if row.get("Test Issue") != "N":
+                    continue
+                if row.get("ETF") != "N":
+                    continue
+                if row.get("NextShares") == "Y":
+                    continue
+
+                description = row.get("Security Name", "")
+                if excluded_terms.search(description):
+                    continue
+
+                if kind == "nasdaq":
+                    add(row.get("Symbol"))
+                elif row.get("Exchange") in ("N", "A"):
+                    add(row.get("ACT Symbol"))
+
+        # Add S&P 500 companies.
+        response = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers={"User-Agent": "StockScreener/1.0"},
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        tables = pd.read_html(io.StringIO(response.text), match="Symbol")
+        for symbol in tables[0]["Symbol"]:
+            add(symbol)
+
+        print(f"Filtered official listings: {len(symbols)} unique symbols")
+        return sorted(symbols)
