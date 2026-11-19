@@ -395,10 +395,22 @@ class Database(metaclass=SingletonMeta):
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - stamp).total_seconds() / 86400
-
     def has_company(self, ticker):
-        return self.conn.execute("SELECT 1 FROM companies WHERE ticker=?", (ticker,)).fetchone() is not None
+        return self.conn.execute(
+            "SELECT 1 FROM companies WHERE ticker=?", (ticker,)
+        ).fetchone() is not None
 
+    def company_name(self, ticker):
+        row = self.conn.execute(
+            "SELECT name FROM companies WHERE ticker=?", (ticker,)
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def company_age_days(self, ticker):
+        return self._age_days("companies", ticker)
+
+    def market_age_days(self, ticker):
+        return self._age_days("market_data", ticker)
     def company_age_days(self, ticker):
         return self._age_days("companies", ticker)
 
